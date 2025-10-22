@@ -62,7 +62,10 @@ class ClarityTracker:
         """
         self.model = model
         self.outdir = outdir
-        os.makedirs(self.outdir, exist_ok=True)
+        try:
+            os.makedirs(self.outdir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create output directory {self.outdir}: {e}")
         self.voxel_size = voxel_size
         self.hutchinson_samples = int(hutchinson_samples)
         self.low_res_render = tuple(low_res_render)
@@ -142,6 +145,17 @@ class ClarityTracker:
             logger.error("Failed to find gaussian positions (mu). Please inspect model and adapt extractor.")
             raise RuntimeError("ClarityTracker: no gaussian positions found.")
         N = mu.shape[0]
+        # Outlier/zero-variance diagnostics
+        try:
+            mu_var = torch.var(mu, dim=0)
+            if torch.any(mu_var == 0):
+                logger.warning(f"Zero-variance detected in gaussian positions: {mu_var}")
+            if torch.any(torch.isnan(mu)):
+                logger.warning("NaN detected in gaussian positions!")
+            if torch.max(torch.abs(mu)) > 1e6:
+                logger.warning(f"Outlier detected in gaussian positions: max(abs(mu))={torch.max(torch.abs(mu))}")
+        except Exception as e:
+            logger.warning(f"Failed outlier/variance check: {e}")
 
         # Build theta_k of length DK (59). We'll place available fields into the vector; missing fields stay zero.
         theta = torch.zeros((N, DK), device=self.device)
@@ -168,7 +182,7 @@ class ClarityTracker:
     # ----------------------
     # Initialization
     # ----------------------
-    def init_covariances(self, N: int, dk: int = DK, init_scale: float = 1e6):
+    def init_covariances(self, N: int, dk: int = DK, init_scale: float = 1e4):
         """Initialize block diagonal covariance P_k = init_scale * I for each gaussian."""
         logger.info(f"Initializing P_blocks: N={N}, dk={dk}, init_scale={init_scale}")
         device = self.device
@@ -330,7 +344,7 @@ class ClarityTracker:
     # ----------------------
     # Covariance update & clarity
     # ----------------------
-    def update_covariances_and_clarity(self, JtJ_blocks: Tensor, reg_eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+    def update_covariances_and_clarity(self, JtJ_blocks: Tensor, reg_eps: float = 1e-3) -> Tuple[Tensor, Tensor]:
         """
         Given JtJ_blocks (N,dk,dk), update P_blocks and compute qk.
         Returns: (new_P_blocks, qk)
@@ -407,6 +421,13 @@ class ClarityTracker:
             self._vis.add_geometry(self._pcd)
             opt = self._vis.get_render_option()
             opt.point_size = 3.0
+            opt.background_color = np.array([0.1, 0.1, 0.1])  # dark gray background
+            # Set some reasonable view parameters
+            ctr = self._vis.get_view_control()
+            ctr.set_zoom(0.7)
+            ctr.set_front([0.0, -0.5, -0.8])  # look from front-up
+            ctr.set_lookat([0.0, 0.0, 0.0])   # look at center
+            ctr.set_up([0.0, 1.0, 0.0])       # Y up
             logger.info("Open3D viewer started for clarity visualization.")
 
     def visualize_pointcloud(self, mu: Tensor, qk: Tensor, step: Optional[int] = None):
@@ -414,27 +435,74 @@ class ClarityTracker:
         Visualize a colored point cloud where color encodes clarity qk (red=clear/high q, green=uncertain low q).
         Non-blocking: updates the same window when called repeatedly.
         """
-        if not _OPEN3D_AVAILABLE:
-            return
-        self._init_open3d()
         pts = mu.detach().cpu().numpy()
         q = qk.detach().cpu().numpy()
-        # colors: red = q, green = (1-q)
+        # Normalize q to [0,1] if needed
+        if np.any(q < 0) or np.any(q > 1):
+            logger.warning(f"Clarity values outside [0,1]: min={q.min()}, max={q.max()}. Normalizing.")
+            q = (q - q.min()) / (q.max() - q.min() + 1e-6)
+        # Red=high clarity (q), green=low clarity (1-q), no blue
         colors = np.stack([q, 1.0 - q, np.zeros_like(q)], axis=1)
-        if self._pcd is None or self._vis is None:
-            logger.debug("Open3D objects not initialized; skipping visualization update.")
-            return
-        self._pcd.points = o3d.utility.Vector3dVector(pts)
-        self._pcd.colors = o3d.utility.Vector3dVector(colors)
-        # update geometry
-        self._vis.update_geometry(self._pcd)
-        self._vis.poll_events()
-        self._vis.update_renderer()
-        # optionally save a snapshot & pointcloud file
-        if step is not None:
-            fname = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.ply")
-            o3d.io.write_point_cloud(fname, self._pcd)
-            logger.info(f"Saved clarity PLY: {fname}")
+        # Ensure colors are visible (boost dim values)
+        colors = np.clip(colors * 1.5, 0, 1)
+        ply_path = None
+        png_path = None
+        if _OPEN3D_AVAILABLE:
+            self._init_open3d()
+            if self._pcd is not None and self._vis is not None:
+                self._pcd.points = o3d.utility.Vector3dVector(pts)
+                self._pcd.colors = o3d.utility.Vector3dVector(colors)
+                self._vis.update_geometry(self._pcd)
+                self._vis.poll_events()
+                self._vis.update_renderer()
+                if step is not None:
+                    ply_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.ply")
+                    try:
+                        o3d.io.write_point_cloud(ply_path, self._pcd)
+                        logger.info(f"Saved clarity PLY: {ply_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save clarity PLY: {e}")
+                    # Save PNG snapshot if possible
+                    try:
+                        png_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.png")
+                        img = self._vis.capture_screen_float_buffer(False)
+                        import matplotlib.pyplot as plt
+                        plt.imsave(png_path, np.asarray(img), format='png')
+                        logger.info(f"Saved clarity PNG: {png_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save clarity PNG: {e}")
+        else:
+            logger.warning("Open3D not available or headless: skipping interactive visualization.")
+            # Save a fallback PNG using matplotlib scatter
+            if step is not None:
+                try:
+                    png_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}_fallback.png")
+                    import matplotlib.pyplot as plt
+                    fig = plt.figure(figsize=(10,8), dpi=150)
+                    ax = fig.add_subplot(111, projection='3d')
+                    # Scale point size based on number of points
+                    point_size = max(1, 100 / np.sqrt(len(pts)))
+                    scatter = ax.scatter(pts[:,0], pts[:,1], pts[:,2], 
+                                      c=colors, s=point_size, alpha=0.6)
+                    ax.set_title(f"Clarity Map Step {step}\nRed=High Clarity, Green=Low Clarity")
+                    ax.set_facecolor((0.1, 0.1, 0.1))  # dark background
+                    fig.set_facecolor((0.1, 0.1, 0.1))
+                    # Add colorbar
+                    plt.colorbar(scatter, label="Clarity")
+                    # Set reasonable view
+                    ax.view_init(elev=20, azim=45)
+                    # Save with higher quality
+                    plt.savefig(png_path, facecolor=fig.get_facecolor(), 
+                              edgecolor='none', bbox_inches='tight',
+                              dpi=150)
+                    plt.close(fig)
+                    logger.info(f"Saved fallback clarity PNG: {png_path}")
+                    # Log color stats
+                    logger.info(f"Color stats - Red(clarity) mean: {colors[:,0].mean():.3f}, "
+                              f"Green(uncertainty) mean: {colors[:,1].mean():.3f}")
+                except Exception as e:
+                    logger.warning(f"Failed to save fallback clarity PNG: {e}")
+        return ply_path, png_path
 
     # ----------------------
     # Top-level update (call from training loop)
@@ -475,16 +543,23 @@ class ClarityTracker:
             Pnew, qk = self.update_covariances_and_clarity(JtJ)
             # visualize pointcloud
             mu = meta.get("mu", theta[:, 0:3])
+            ply_path, png_path = None, None
             try:
-                self.visualize_pointcloud(mu, qk, step=global_step)
+                ply_path, png_path = self.visualize_pointcloud(mu, qk, step=global_step)
             except Exception as e:
                 logger.warning(f"Open3D visualization failed: {e}")
-            # save P_blocks and qk
+            # save P_blocks and qk with robust logging
+            pt_path = os.path.join(self.outdir, f"P_blocks_step_{global_step:06d}.pt")
+            npy_path = os.path.join(self.outdir, f"qk_step_{global_step:06d}.npy")
             try:
                 if self.P_blocks is not None:
-                    torch.save(self.P_blocks.detach().cpu(), os.path.join(self.outdir, f"P_blocks_step_{global_step:06d}.pt"))
-                np.save(os.path.join(self.outdir, f"qk_step_{global_step:06d}.npy"), qk.detach().cpu().numpy())
+                    torch.save(self.P_blocks.detach().cpu(), pt_path)
+                    logger.info(f"Saved P_blocks: {pt_path}")
+                np.save(npy_path, qk.detach().cpu().numpy())
+                logger.info(f"Saved qk: {npy_path}")
             except Exception as e:
                 logger.warning(f"Failed to save clarity artifacts: {e}")
+            # summary log
+            logger.info(f"Clarity step {global_step}: N={N}, P_blocks={pt_path}, qk={npy_path}, ply={ply_path}, png={png_path}")
         except Exception as e:
             logger.exception(f"ClarityTracker.step_end_callback failed at step {global_step}: {e}")

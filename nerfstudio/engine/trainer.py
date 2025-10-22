@@ -537,7 +537,7 @@ class Trainer:
                     model=self.pipeline.model,
                     outdir=outdir,
                     low_res_render=(160, 120),
-                    hutchinson_samples=1,  # keep low for interactive testing; increase to 2-4 for more accuracy
+                    hutchinson_samples=4,  # Increased for better J^T J estimation
                     update_every_n_steps=1,
                     sigma2=1e-4,
                 )
