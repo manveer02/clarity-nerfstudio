@@ -40,6 +40,7 @@ from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttrib
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils import profiler, writer
+from nerfstudio.utils.clarity_map import ClarityTracker
 from nerfstudio.utils.decorators import check_eval_enabled, check_main_thread, check_viewer_enabled
 from nerfstudio.utils.misc import step_check
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -525,6 +526,44 @@ class Trainer:
         # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
         if scale <= self.grad_scaler.get_scale():
             self.optimizers.scheduler_step_all(step)
+
+        # --- Clarity tracker integration: create once & call step callback ---
+        try:
+            # create a single tracker instance attached to pipeline.model
+            if not hasattr(self.pipeline.model, "clarity_tracker"):
+                # outdir: create inside base_dir for easy access
+                outdir = os.path.join(str(self.base_dir), "outputs", "clarity")
+                self.pipeline.model.clarity_tracker = ClarityTracker(
+                    model=self.pipeline.model,
+                    outdir=outdir,
+                    low_res_render=(160, 120),
+                    hutchinson_samples=1,  # keep low for interactive testing; increase to 2-4 for more accuracy
+                    update_every_n_steps=1,
+                    sigma2=1e-4,
+                )
+            # attempt to pass a camera if available on the pipeline (best-effort). If not found, tracker will fallback.
+            camera = None
+            # try common pipeline attributes for the camera used this iteration
+            try:
+                if hasattr(self.pipeline, "last_camera"):
+                    camera = getattr(self.pipeline, "last_camera")
+                elif hasattr(self.pipeline, "camera"):
+                    camera = getattr(self.pipeline, "camera")
+                # pipeline.get_train_loss_dict used earlier; some pipelines may store batch camera used in pipeline._last_batch (best-effort)
+                elif hasattr(self.pipeline, "_last_batch") and isinstance(self.pipeline._last_batch, dict) and "cameras" in self.pipeline._last_batch:
+                    camera = self.pipeline._last_batch["cameras"]
+            except Exception:
+                camera = None
+
+            # call the tracker (non-blocking visualization if open3d available)
+            try:
+                self.pipeline.model.clarity_tracker.step_end_callback(global_step=step, camera=camera)
+            except Exception as e:
+                # don't let clarity crash the training loop
+                CONSOLE.log(f"ClarityTracker step failed: {e}")
+        except Exception as e:
+            # safe fallback
+            CONSOLE.log(f"Failed to initialize/run ClarityTracker: {e}")
 
         # Merging loss and metrics dict into a single output.
         return loss, loss_dict, metrics_dict  # type: ignore

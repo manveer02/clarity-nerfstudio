@@ -492,6 +492,8 @@ class SplatfactoModel(Model):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        self.last_camera = camera  # store camera for clarity tracker
+
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
