@@ -441,6 +441,13 @@ class ClarityTracker:
         if np.any(q < 0) or np.any(q > 1):
             logger.warning(f"Clarity values outside [0,1]: min={q.min()}, max={q.max()}. Normalizing.")
             q = (q - q.min()) / (q.max() - q.min() + 1e-6)
+        # Normalize qk for color visualization
+        if qk.numel() > 0:
+            q_norm = (qk - qk.min()) / (qk.max() - qk.min() + 1e-8)
+        else:
+            q_norm = qk
+        colors = np.stack([q_norm, 1.0 - q_norm, np.zeros_like(q_norm)], axis=1)
+
         # Red=high clarity (q), green=low clarity (1-q), no blue
         colors = np.stack([q, 1.0 - q, np.zeros_like(q)], axis=1)
         # Ensure colors are visible (boost dim values)
@@ -514,8 +521,9 @@ class ClarityTracker:
         to extract a reasonable camera from the pipeline/model (best-effort).
         """
         self.step_counter += 1
-        if (global_step % self.update_every_n_steps) != 0:
+        if global_step < 100 or (global_step % self.update_every_n_steps) != 0:
             return
+
 
         # try to obtain camera object if not provided
         cam = camera
@@ -543,6 +551,14 @@ class ClarityTracker:
             Pnew, qk = self.update_covariances_and_clarity(JtJ)
             # visualize pointcloud
             mu = meta.get("mu", theta[:, 0:3])
+            # Skip saving if no Gaussians
+            if mu is None or mu.shape[0] == 0:
+                logger.warning(f"[ClarityTracker] Step {global_step}: no Gaussian points found, skipping clarity save.")
+                return
+            if torch.isnan(mu).any():
+                logger.warning(f"[ClarityTracker] NaN detected in Gaussian positions, skipping clarity save.")
+                return
+
             ply_path, png_path = None, None
             try:
                 ply_path, png_path = self.visualize_pointcloud(mu, qk, step=global_step)
