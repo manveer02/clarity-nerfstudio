@@ -435,80 +435,101 @@ class ClarityTracker:
         Visualize a colored point cloud where color encodes clarity qk (red=clear/high q, green=uncertain low q).
         Non-blocking: updates the same window when called repeatedly.
         """
-        pts = mu.detach().cpu().numpy()
-        q = qk.detach().cpu().numpy()
-        # Normalize q to [0,1] if needed
+        # Force Open3D to use CPU rendering in headless/container environments (safe).
+        # You can remove this if you run with an X display forwarded.
+        try:
+            os.environ["OPEN3D_CPU_RENDERING"] = "true"
+        except Exception:
+            pass
+
+        # Ensure tensors are on CPU and numpy arrays
+        try:
+            pts = mu.detach().cpu().numpy()
+        except Exception as e:
+            logger.warning(f"Failed to convert mu to numpy: {e}")
+            return None, None
+
+        try:
+            q = qk.detach().cpu().numpy()
+        except Exception as e:
+            logger.warning(f"Failed to convert qk to numpy: {e}")
+            q = np.zeros((pts.shape[0],), dtype=np.float32)
+
+        # Guard: empty points
+        if pts.size == 0 or q.size == 0 or len(pts) != len(q):
+            logger.warning("Empty or mismatched pts/q arrays; skipping visualization.")
+            return None, None
+
+        # Normalize q to [0,1]
         if np.any(q < 0) or np.any(q > 1):
             logger.warning(f"Clarity values outside [0,1]: min={q.min()}, max={q.max()}. Normalizing.")
-            q = (q - q.min()) / (q.max() - q.min() + 1e-6)
-        # Normalize qk for color visualization
-        if qk.numel() > 0:
-            q_norm = (qk - qk.min()) / (qk.max() - qk.min() + 1e-8)
+        q_min, q_max = float(np.nanmin(q)), float(np.nanmax(q))
+        if np.isfinite(q_min) and np.isfinite(q_max) and (q_max - q_min) > 1e-8:
+            q_norm = (q - q_min) / (q_max - q_min)
         else:
-            q_norm = qk
-        colors = np.stack([q_norm, 1.0 - q_norm, np.zeros_like(q_norm)], axis=1)
+            q_norm = np.clip(q, 0.0, 1.0)
 
-        # Red=high clarity (q), green=low clarity (1-q), no blue
-        colors = np.stack([q, 1.0 - q, np.zeros_like(q)], axis=1)
-        # Ensure colors are visible (boost dim values)
-        colors = np.clip(colors * 1.5, 0, 1)
+        # Color mapping: red = high clarity, green = low clarity
+        colors = np.stack([q_norm, 1.0 - q_norm, np.zeros_like(q_norm)], axis=1)
+        colors = np.clip(colors * 1.5, 0.0, 1.0)
+
         ply_path = None
         png_path = None
+
         if _OPEN3D_AVAILABLE:
             self._init_open3d()
             if self._pcd is not None and self._vis is not None:
-                self._pcd.points = o3d.utility.Vector3dVector(pts)
-                self._pcd.colors = o3d.utility.Vector3dVector(colors)
-                self._vis.update_geometry(self._pcd)
-                self._vis.poll_events()
-                self._vis.update_renderer()
-                if step is not None:
-                    ply_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.ply")
-                    try:
-                        o3d.io.write_point_cloud(ply_path, self._pcd)
-                        logger.info(f"Saved clarity PLY: {ply_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to save clarity PLY: {e}")
-                    # Save PNG snapshot if possible
-                    try:
-                        png_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.png")
-                        img = self._vis.capture_screen_float_buffer(False)
-                        import matplotlib.pyplot as plt
-                        plt.imsave(png_path, np.asarray(img), format='png')
-                        logger.info(f"Saved clarity PNG: {png_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to save clarity PNG: {e}")
+                try:
+                    self._pcd.points = o3d.utility.Vector3dVector(pts)
+                    self._pcd.colors = o3d.utility.Vector3dVector(colors)
+                    self._vis.update_geometry(self._pcd)
+                    self._vis.poll_events()
+                    self._vis.update_renderer()
+
+                    if step is not None:
+                        # Save PLY
+                        ply_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.ply")
+                        try:
+                            o3d.io.write_point_cloud(ply_path, self._pcd)
+                            logger.info(f"Saved clarity PLY: {ply_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to save clarity PLY: {e}; ply_path={ply_path}")
+
+                        # Save PNG snapshot (capture screen)
+                        try:
+                            png_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}.png")
+                            img = self._vis.capture_screen_float_buffer(False)
+                            arr = np.asarray(img)
+                            # arr is float in [0,1], convert to image
+                            import matplotlib.pyplot as plt
+                            plt.imsave(png_path, arr, format="png")
+                            logger.info(f"Saved clarity PNG: {png_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to save clarity PNG: {e}; png_path={png_path}")
+                except Exception as e:
+                    logger.warning(f"Open3D geometry update failed: {e}")
         else:
             logger.warning("Open3D not available or headless: skipping interactive visualization.")
-            # Save a fallback PNG using matplotlib scatter
+            # Fallback matplotlib 3D scatter and save PNG
             if step is not None:
                 try:
                     png_path = os.path.join(self.outdir, f"clarity_pcd_step_{step:06d}_fallback.png")
                     import matplotlib.pyplot as plt
-                    fig = plt.figure(figsize=(10,8), dpi=150)
-                    ax = fig.add_subplot(111, projection='3d')
-                    # Scale point size based on number of points
+                    fig = plt.figure(figsize=(10, 8), dpi=150)
+                    ax = fig.add_subplot(111, projection="3d")
                     point_size = max(1, 100 / np.sqrt(len(pts)))
-                    scatter = ax.scatter(pts[:,0], pts[:,1], pts[:,2], 
-                                      c=colors, s=point_size, alpha=0.6)
+                    scatter = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors, s=point_size, alpha=0.6)
                     ax.set_title(f"Clarity Map Step {step}\nRed=High Clarity, Green=Low Clarity")
-                    ax.set_facecolor((0.1, 0.1, 0.1))  # dark background
+                    ax.set_facecolor((0.1, 0.1, 0.1))
                     fig.set_facecolor((0.1, 0.1, 0.1))
-                    # Add colorbar
                     plt.colorbar(scatter, label="Clarity")
-                    # Set reasonable view
                     ax.view_init(elev=20, azim=45)
-                    # Save with higher quality
-                    plt.savefig(png_path, facecolor=fig.get_facecolor(), 
-                              edgecolor='none', bbox_inches='tight',
-                              dpi=150)
+                    plt.savefig(png_path, facecolor=fig.get_facecolor(), bbox_inches="tight", dpi=150)
                     plt.close(fig)
                     logger.info(f"Saved fallback clarity PNG: {png_path}")
-                    # Log color stats
-                    logger.info(f"Color stats - Red(clarity) mean: {colors[:,0].mean():.3f}, "
-                              f"Green(uncertainty) mean: {colors[:,1].mean():.3f}")
                 except Exception as e:
                     logger.warning(f"Failed to save fallback clarity PNG: {e}")
+
         return ply_path, png_path
 
     # ----------------------
